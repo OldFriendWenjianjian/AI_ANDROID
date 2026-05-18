@@ -2,13 +2,20 @@ package com.example.aiandroidchat;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.Manifest;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.hardware.Camera;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.Window;
@@ -26,6 +33,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -48,6 +56,7 @@ public class MainActivity extends Activity {
     private static final String KEY_EMAIL = "email";
     private static final String KEY_MODEL = "model";
     private static final int GATEWAY_API_KEY_VERSION = 2;
+    private static final int REQUEST_CAMERA_PERMISSION = 1001;
     private static final String DEFAULT_MODEL = "gpt-5.4-mini";
     private static final String[] DEFAULT_MODELS = {
             "gpt-5.4-mini",
@@ -68,10 +77,12 @@ public class MainActivity extends Activity {
     private LinearLayout messagesLayout;
     private ScrollView scrollView;
     private EditText input;
+    private Button cameraButton;
     private Button sendButton;
     private ProgressBar progressBar;
     private TextView statusText;
     private ChatMessage pendingMessage;
+    private PendingPhotoAction pendingPhotoAction;
     private final Random random = new Random();
 
     @Override
@@ -181,6 +192,14 @@ public class MainActivity extends Activity {
         composer.addView(input, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
+        cameraButton = new Button(this);
+        cameraButton.setText("拍照");
+        cameraButton.setAllCaps(false);
+        cameraButton.setOnClickListener(v -> takePhoto());
+        LinearLayout.LayoutParams cameraParams = new LinearLayout.LayoutParams(dp(68), dp(52));
+        cameraParams.leftMargin = dp(8);
+        composer.addView(cameraButton, cameraParams);
+
         sendButton = new Button(this);
         sendButton.setText("发送");
         sendButton.setTextColor(Color.WHITE);
@@ -193,6 +212,19 @@ public class MainActivity extends Activity {
 
         root.addView(composer);
         return root;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_CAMERA_PERMISSION) {
+            return;
+        }
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED && pendingPhotoAction != null) {
+            showCameraDialog(pendingPhotoAction);
+        } else {
+            Toast.makeText(this, "需要相机权限才能拍图识别", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private Button topButton(String text) {
@@ -286,7 +318,7 @@ public class MainActivity extends Activity {
         renderMessages();
         setLoading(true, "正在连接服务器...");
 
-        ArrayList<ChatMessage> requestMessages = new ArrayList<>(messages);
+        ArrayList<ChatMessage> requestMessages = messagesWithoutPending();
         String model = getModel();
         executor.execute(() -> {
             try {
@@ -309,6 +341,138 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    private void takePhoto() {
+        if (!isLoggedIn()) {
+            showAuthDialog(false);
+            Toast.makeText(this, "请先登录" + BRAND_NAME + "账号", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        hideKeyboard();
+        PendingPhotoAction action = new PendingPhotoAction(input.getText().toString().trim());
+        if (android.os.Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            pendingPhotoAction = action;
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION);
+            return;
+        }
+        showCameraDialog(action);
+    }
+
+    private void showCameraDialog(PendingPhotoAction action) {
+        pendingPhotoAction = action;
+        CameraCaptureView captureView = new CameraCaptureView(this);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("拍图识别")
+                .setView(captureView)
+                .setPositiveButton("识别", null)
+                .setNegativeButton("取消", null)
+                .create();
+        dialog.setOnShowListener(d -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+                captureView.takePicture(jpegBytes -> runOnUiThread(() -> {
+                    dialog.dismiss();
+                    sendPhotoForRecognition(jpegBytes, action.prompt);
+                }), error -> runOnUiThread(() -> {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
+                    Toast.makeText(this, error, Toast.LENGTH_SHORT).show();
+                }));
+            });
+        });
+        dialog.setOnDismissListener(d -> captureView.releaseCamera());
+        dialog.show();
+    }
+
+    private void sendPhotoForRecognition(byte[] jpegBytes, String promptText) {
+        byte[] imageBytes = normalizeVisionImage(jpegBytes);
+        ensureActiveConversation();
+        String prompt = promptText == null ? "" : promptText.trim();
+        if (prompt.isEmpty()) {
+            prompt = "请识别并描述这张图片。";
+        }
+        input.setText("");
+        if (messages.isEmpty()) {
+            currentConversation.title = "图片识别";
+        }
+        ChatMessage userPhotoMessage = new ChatMessage(ChatMessage.ROLE_USER, "[图片] " + prompt);
+        messages.add(userPhotoMessage);
+        pendingMessage = new ChatMessage(ChatMessage.ROLE_ASSISTANT, "正在连接服务器...");
+        messages.add(pendingMessage);
+        saveCurrentConversation();
+        renderMessages();
+        setLoading(true, "正在连接服务器...");
+
+        ArrayList<ChatMessage> requestMessages = messagesBefore(userPhotoMessage);
+        String model = getModel();
+        String finalPrompt = prompt;
+        executor.execute(() -> {
+            try {
+                String apiKey = ensureGatewayApiKey();
+                client.ping(apiKey);
+                runOnUiThread(() -> updatePendingMessage("服务器已连通，正在识别图片..."));
+                String answer = client.visionChat(apiKey, model, requestMessages, imageBytes, finalPrompt);
+                runOnUiThread(() -> {
+                    replacePendingMessage(answer);
+                    saveCurrentConversation();
+                    renderMessages();
+                    setLoading(false, "");
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    replacePendingMessage(userFacingError(e));
+                    saveCurrentConversation();
+                    renderMessages();
+                    setLoading(false, "");
+                });
+            }
+        });
+    }
+
+    private byte[] normalizeVisionImage(byte[] jpegBytes) {
+        Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+        if (bitmap == null) {
+            return jpegBytes;
+        }
+        int maxSide = Math.max(bitmap.getWidth(), bitmap.getHeight());
+        Bitmap target = bitmap;
+        if (maxSide > 1024) {
+            float scale = 1024f / maxSide;
+            int width = Math.max(1, Math.round(bitmap.getWidth() * scale));
+            int height = Math.max(1, Math.round(bitmap.getHeight() * scale));
+            target = Bitmap.createScaledBitmap(bitmap, width, height, true);
+        }
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        target.compress(Bitmap.CompressFormat.JPEG, 82, output);
+        if (target != bitmap) {
+            target.recycle();
+        }
+        bitmap.recycle();
+        return output.toByteArray();
+    }
+
+    private ArrayList<ChatMessage> messagesWithoutPending() {
+        ArrayList<ChatMessage> snapshot = new ArrayList<>();
+        for (ChatMessage message : messages) {
+            if (message != pendingMessage) {
+                snapshot.add(message);
+            }
+        }
+        return snapshot;
+    }
+
+    private ArrayList<ChatMessage> messagesBefore(ChatMessage boundary) {
+        ArrayList<ChatMessage> snapshot = new ArrayList<>();
+        for (ChatMessage message : messages) {
+            if (message == boundary) {
+                break;
+            }
+            if (message != pendingMessage) {
+                snapshot.add(message);
+            }
+        }
+        return snapshot;
     }
 
     private String userFacingError(Exception e) {
@@ -724,6 +888,7 @@ public class MainActivity extends Activity {
         progressBar.setVisibility(loading ? View.VISIBLE : View.GONE);
         statusText.setText(status == null ? "" : status);
         statusText.setVisibility(loading ? View.VISIBLE : View.GONE);
+        cameraButton.setEnabled(!loading);
         sendButton.setEnabled(!loading);
         input.setEnabled(!loading);
     }
@@ -869,5 +1034,187 @@ public class MainActivity extends Activity {
             conversation.refreshTitle();
             return conversation;
         }
+    }
+
+    private static final class PendingPhotoAction {
+        final String prompt;
+
+        PendingPhotoAction(String prompt) {
+            this.prompt = prompt;
+        }
+    }
+
+    private static final class CameraCaptureView extends SurfaceView implements SurfaceHolder.Callback {
+        private Camera camera;
+        private boolean previewing;
+        private boolean focusing;
+
+        CameraCaptureView(Context context) {
+            super(context);
+            getHolder().addCallback(this);
+        }
+
+        @Override
+        public void surfaceCreated(SurfaceHolder holder) {
+            openCamera(holder);
+        }
+
+        @Override
+        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+            if (camera == null) {
+                openCamera(holder);
+                return;
+            }
+            try {
+                camera.stopPreview();
+            } catch (Exception ignored) {
+                // Preview may not have started yet.
+            }
+            startPreview(holder);
+        }
+
+        @Override
+        public void surfaceDestroyed(SurfaceHolder holder) {
+            releaseCamera();
+        }
+
+        void takePicture(PhotoCallback success, ErrorCallback error) {
+            if (camera == null || !previewing) {
+                error.onError("相机尚未准备好");
+                return;
+            }
+            try {
+                if (supportsFocusMode(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                    focusing = true;
+                    camera.autoFocus((focused, c) -> {
+                        focusing = false;
+                        captureNow(success, error);
+                    });
+                } else {
+                    captureNow(success, error);
+                }
+            } catch (Exception e) {
+                focusing = false;
+                error.onError("拍照失败");
+            }
+        }
+
+        private void captureNow(PhotoCallback success, ErrorCallback error) {
+            try {
+                camera.takePicture(null, null, (data, c) -> success.onPhoto(data));
+            } catch (Exception e) {
+                error.onError("拍照失败");
+            }
+        }
+
+        void releaseCamera() {
+            if (camera != null) {
+                try {
+                    camera.stopPreview();
+                } catch (Exception ignored) {
+                    // Ignore release-time preview errors.
+                }
+                if (focusing) {
+                    try {
+                        camera.cancelAutoFocus();
+                    } catch (Exception ignored) {
+                        // Ignore focus cancellation errors while releasing.
+                    }
+                    focusing = false;
+                }
+                camera.release();
+                camera = null;
+                previewing = false;
+            }
+        }
+
+        private void openCamera(SurfaceHolder holder) {
+            try {
+                camera = Camera.open();
+                camera.setDisplayOrientation(90);
+                configureCamera();
+                startPreview(holder);
+            } catch (Exception e) {
+                releaseCamera();
+            }
+        }
+
+        private void configureCamera() {
+            if (camera == null) {
+                return;
+            }
+            try {
+                Camera.Parameters params = camera.getParameters();
+                if (supportsFocusMode(params, Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                } else if (supportsFocusMode(params, Camera.Parameters.FOCUS_MODE_AUTO)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                }
+                if (params.getSupportedFlashModes() != null
+                        && params.getSupportedFlashModes().contains(Camera.Parameters.FLASH_MODE_AUTO)) {
+                    params.setFlashMode(Camera.Parameters.FLASH_MODE_AUTO);
+                }
+                Camera.Size size = choosePictureSize(params.getSupportedPictureSizes());
+                if (size != null) {
+                    params.setPictureSize(size.width, size.height);
+                }
+                camera.setParameters(params);
+            } catch (Exception ignored) {
+                // Keep the camera usable even if one optional parameter is rejected by the device.
+            }
+        }
+
+        private boolean supportsFocusMode(String mode) {
+            if (camera == null) {
+                return false;
+            }
+            try {
+                return supportsFocusMode(camera.getParameters(), mode);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        private boolean supportsFocusMode(Camera.Parameters params, String mode) {
+            return params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(mode);
+        }
+
+        private Camera.Size choosePictureSize(List<Camera.Size> sizes) {
+            if (sizes == null || sizes.isEmpty()) {
+                return null;
+            }
+            Camera.Size best = sizes.get(0);
+            long bestPixels = Math.abs((long) best.width * best.height - 2_000_000L);
+            for (Camera.Size size : sizes) {
+                long pixels = (long) size.width * size.height;
+                long delta = Math.abs(pixels - 2_000_000L);
+                if (delta < bestPixels) {
+                    best = size;
+                    bestPixels = delta;
+                }
+            }
+            return best;
+        }
+
+        private void startPreview(SurfaceHolder holder) {
+            if (camera == null) {
+                return;
+            }
+            try {
+                camera.setPreviewDisplay(holder);
+                camera.startPreview();
+                previewing = true;
+            } catch (Exception e) {
+                releaseCamera();
+            }
+        }
+    }
+
+    private interface PhotoCallback {
+        void onPhoto(byte[] jpegBytes);
+    }
+
+    private interface ErrorCallback {
+        void onError(String error);
     }
 }

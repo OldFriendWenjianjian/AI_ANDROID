@@ -73,15 +73,16 @@ Assert-Contains $ime 'mInputShown=true' '输入法没有弹出，无法验证遮
 Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_regression.xml') | Out-Null
 $xml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_regression.xml') | Out-String
 $inputBounds = Get-NodeBounds $xml '输入消息'
+$cameraBounds = Get-NodeBounds $xml '拍照'
 $sendBounds = Get-NodeBounds $xml '发送'
 
 # On this 1080x2388 device, a covered composer remains near the bottom
 # around y=2200. A visible composer above the Sogou IME sits around y=1280.
 $safeBottom = 1700
-if ($inputBounds.Bottom -gt $safeBottom -or $sendBounds.Bottom -gt $safeBottom) {
-    throw "输入栏仍可能被键盘遮挡：inputBottom=$($inputBounds.Bottom), sendBottom=$($sendBounds.Bottom)"
+if ($inputBounds.Bottom -gt $safeBottom -or $cameraBounds.Bottom -gt $safeBottom -or $sendBounds.Bottom -gt $safeBottom) {
+    throw "输入栏仍可能被键盘遮挡：inputBottom=$($inputBounds.Bottom), cameraBottom=$($cameraBounds.Bottom), sendBottom=$($sendBounds.Bottom)"
 }
-Write-Host "键盘回归通过：inputBottom=$($inputBounds.Bottom), sendBottom=$($sendBounds.Bottom)"
+Write-Host "键盘回归通过：inputBottom=$($inputBounds.Bottom), cameraBottom=$($cameraBounds.Bottom), sendBottom=$($sendBounds.Bottom)"
 
 Write-Host '5/6 验证新建和历史入口...'
 Invoke-Adb @('shell', 'input', 'keyevent', 'BACK') | Out-Null

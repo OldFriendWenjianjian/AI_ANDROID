@@ -169,6 +169,19 @@ final class NiumaClient {
         }
     }
 
+    String visionChat(String apiKey, String model, List<ChatMessage> history, byte[] jpegBytes, String prompt)
+            throws IOException, JSONException {
+        try {
+            return visionChatOnce(apiKey, model, history, jpegBytes, prompt);
+        } catch (IOException e) {
+            String message = e.getMessage() == null ? "" : e.getMessage();
+            if (!FALLBACK_MODEL.equals(model) && (message.contains("503") || message.contains("Service temporarily unavailable"))) {
+                return visionChatOnce(apiKey, FALLBACK_MODEL, history, jpegBytes, prompt);
+            }
+            throw e;
+        }
+    }
+
     private String chatOnce(String apiKey, String model, List<ChatMessage> history) throws IOException, JSONException {
         HttpURLConnection connection = open("POST", BASE_URL + "/v1/chat/completions", null);
         connection.setRequestProperty("Authorization", "Bearer " + apiKey);
@@ -176,6 +189,35 @@ final class NiumaClient {
         JSONObject body = new JSONObject();
         body.put("model", model == null || model.trim().isEmpty() ? FALLBACK_MODEL : model.trim());
         body.put("messages", buildMessages(history));
+        body.put("stream", false);
+        writeBody(connection, body);
+
+        int code = connection.getResponseCode();
+        String response = readAll(code >= 200 && code < 300
+                ? connection.getInputStream()
+                : connection.getErrorStream());
+        if (code < 200 || code >= 300) {
+            throw new IOException(parseError(code, response));
+        }
+        JSONObject root = new JSONObject(response);
+        JSONArray choices = root.optJSONArray("choices");
+        if (choices != null && choices.length() > 0) {
+            JSONObject message = choices.optJSONObject(0).optJSONObject("message");
+            if (message != null) {
+                return message.optString("content", response);
+            }
+        }
+        return response;
+    }
+
+    private String visionChatOnce(String apiKey, String model, List<ChatMessage> history, byte[] jpegBytes, String prompt)
+            throws IOException, JSONException {
+        HttpURLConnection connection = open("POST", BASE_URL + "/v1/chat/completions", null);
+        connection.setRequestProperty("Authorization", "Bearer " + apiKey);
+
+        JSONObject body = new JSONObject();
+        body.put("model", model == null || model.trim().isEmpty() ? FALLBACK_MODEL : model.trim());
+        body.put("messages", buildVisionMessages(history, jpegBytes, prompt));
         body.put("stream", false);
         writeBody(connection, body);
 
@@ -212,6 +254,31 @@ final class NiumaClient {
             item.put("content", message.content);
             messages.put(item);
         }
+        return messages;
+    }
+
+    private JSONArray buildVisionMessages(List<ChatMessage> history, byte[] jpegBytes, String prompt) throws JSONException {
+        JSONArray messages = buildMessages(history);
+        JSONObject user = new JSONObject();
+        user.put("role", ChatMessage.ROLE_USER);
+
+        JSONArray content = new JSONArray();
+        JSONObject text = new JSONObject();
+        text.put("type", "text");
+        text.put("text", prompt == null || prompt.trim().isEmpty()
+                ? "请识别并描述这张图片，尽量用中文给出关键内容。"
+                : prompt.trim());
+        content.put(text);
+
+        JSONObject imageUrl = new JSONObject();
+        imageUrl.put("url", "data:image/jpeg;base64," + android.util.Base64.encodeToString(jpegBytes, android.util.Base64.NO_WRAP));
+        JSONObject image = new JSONObject();
+        image.put("type", "image_url");
+        image.put("image_url", imageUrl);
+        content.put(image);
+
+        user.put("content", content);
+        messages.put(user);
         return messages;
     }
 
