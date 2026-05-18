@@ -1,0 +1,17 @@
+.gradle/
+.idea/
+build/
+app/build/
+local.properties
+*.iml
+
+# Local debugging artifacts generated during real-device testing.
+/*.png
+/*.xml
+
+# Downloaded web bundles / API probe files used during reverse engineering.
+/*.js
+/probe_*.ps1
+
+# Keep project scripts tracked.
+!/scripts/*.ps1
