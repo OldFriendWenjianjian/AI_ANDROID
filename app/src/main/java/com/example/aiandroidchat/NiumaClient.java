@@ -252,7 +252,7 @@ final class NiumaClient {
             JSONObject item = new JSONObject();
             item.put("role", message.role);
             item.put("content", message.hasImage()
-                    ? "[图片] " + message.content
+                    ? "[" + ("sheet_music".equals(message.imageMode) ? "乐谱图片" : "图片") + "] " + message.content
                     : message.content);
             messages.put(item);
         }

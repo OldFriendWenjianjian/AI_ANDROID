@@ -7,11 +7,14 @@ final class ChatMessage {
     static final String ROLE_USER = "user";
     static final String ROLE_ASSISTANT = "assistant";
     static final String ROLE_SYSTEM = "system";
+    static final String IMAGE_MODE_PHOTO = "photo";
+    static final String IMAGE_MODE_SHEET_MUSIC = "sheet_music";
 
     final String role;
     final String content;
     final long createdAt;
     final String imageThumbnailBase64;
+    final String imageMode;
 
     ChatMessage(String role, String content) {
         this(role, content, System.currentTimeMillis(), "");
@@ -22,10 +25,15 @@ final class ChatMessage {
     }
 
     ChatMessage(String role, String content, long createdAt, String imageThumbnailBase64) {
+        this(role, content, createdAt, imageThumbnailBase64, IMAGE_MODE_PHOTO);
+    }
+
+    ChatMessage(String role, String content, long createdAt, String imageThumbnailBase64, String imageMode) {
         this.role = role;
         this.content = content;
         this.createdAt = createdAt;
         this.imageThumbnailBase64 = imageThumbnailBase64 == null ? "" : imageThumbnailBase64;
+        this.imageMode = imageMode == null || imageMode.trim().isEmpty() ? IMAGE_MODE_PHOTO : imageMode.trim();
     }
 
     boolean isUser() {
@@ -36,8 +44,8 @@ final class ChatMessage {
         return !imageThumbnailBase64.isEmpty();
     }
 
-    static ChatMessage photo(String prompt, String thumbnailBase64) {
-        return new ChatMessage(ROLE_USER, prompt, System.currentTimeMillis(), thumbnailBase64);
+    static ChatMessage photo(String prompt, String thumbnailBase64, String imageMode) {
+        return new ChatMessage(ROLE_USER, prompt, System.currentTimeMillis(), thumbnailBase64, imageMode);
     }
 
     JSONObject toJson() throws JSONException {
@@ -47,6 +55,7 @@ final class ChatMessage {
         object.put("createdAt", createdAt);
         if (hasImage()) {
             object.put("imageThumbnailBase64", imageThumbnailBase64);
+            object.put("imageMode", imageMode);
         }
         return object;
     }
@@ -56,6 +65,7 @@ final class ChatMessage {
                 object.optString("role", ROLE_ASSISTANT),
                 object.optString("content", ""),
                 object.optLong("createdAt", System.currentTimeMillis()),
-                object.optString("imageThumbnailBase64", ""));
+                object.optString("imageThumbnailBase64", ""),
+                object.optString("imageMode", IMAGE_MODE_PHOTO));
     }
 }

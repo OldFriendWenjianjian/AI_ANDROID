@@ -65,6 +65,12 @@ public class MainActivity extends Activity {
     private static final int GATEWAY_API_KEY_VERSION = 2;
     private static final int REQUEST_CAMERA_PERMISSION = 1001;
     private static final int MODEL_LOAD_TIMEOUT_MS = 8_000;
+    private static final String IMAGE_MODE_PHOTO = ChatMessage.IMAGE_MODE_PHOTO;
+    private static final String IMAGE_MODE_SHEET_MUSIC = ChatMessage.IMAGE_MODE_SHEET_MUSIC;
+    private static final String SHEET_MUSIC_DEFAULT_PROMPT =
+            "请扫描这张乐谱，按原图尽量准确识别。不要编造看不清的内容；不清楚的位置请标为“待确认”。"
+                    + "\n请输出：1. 标题/调号/拍号/速度/乐器或声部；2. 按系统和小节整理音符、节奏、和弦、歌词、指法或TAB品位；"
+                    + "3. 重复记号、反复段落、升降号和休止符；4. 可疑或模糊的小节；5. 如信息足够，给出可复制的 MusicXML 草稿。";
     private static final String DEFAULT_MODEL = "gpt-5.4-mini";
     private static final String[] DEFAULT_MODELS = {
             "gpt-5.4-mini",
@@ -90,6 +96,7 @@ public class MainActivity extends Activity {
     private TextView pendingPhotoText;
     private EditText input;
     private Button cameraButton;
+    private Button sheetMusicButton;
     private Button sendButton;
     private ProgressBar progressBar;
     private TextView statusText;
@@ -257,10 +264,18 @@ public class MainActivity extends Activity {
         cameraButton = new Button(this);
         cameraButton.setText("拍照");
         cameraButton.setAllCaps(false);
-        cameraButton.setOnClickListener(v -> takePhoto());
-        LinearLayout.LayoutParams cameraParams = new LinearLayout.LayoutParams(dp(68), dp(52));
+        cameraButton.setOnClickListener(v -> takePhoto(IMAGE_MODE_PHOTO));
+        LinearLayout.LayoutParams cameraParams = new LinearLayout.LayoutParams(dp(58), dp(52));
         cameraParams.leftMargin = dp(8);
         composer.addView(cameraButton, cameraParams);
+
+        sheetMusicButton = new Button(this);
+        sheetMusicButton.setText("乐谱");
+        sheetMusicButton.setAllCaps(false);
+        sheetMusicButton.setOnClickListener(v -> takePhoto(IMAGE_MODE_SHEET_MUSIC));
+        LinearLayout.LayoutParams sheetMusicParams = new LinearLayout.LayoutParams(dp(58), dp(52));
+        sheetMusicParams.leftMargin = dp(6);
+        composer.addView(sheetMusicButton, sheetMusicParams);
 
         sendButton = new Button(this);
         sendButton.setText("发送");
@@ -268,8 +283,8 @@ public class MainActivity extends Activity {
         sendButton.setAllCaps(false);
         sendButton.setBackgroundResource(R.drawable.send_button);
         sendButton.setOnClickListener(v -> sendMessage());
-        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(82), dp(52));
-        sendParams.leftMargin = dp(8);
+        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(74), dp(52));
+        sendParams.leftMargin = dp(6);
         composer.addView(sendButton, sendParams);
 
         root.addView(composer);
@@ -441,14 +456,14 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void takePhoto() {
+    private void takePhoto(String imageMode) {
         if (!isLoggedIn()) {
             showAuthDialog(false);
             Toast.makeText(this, "请先登录" + BRAND_NAME + "账号", Toast.LENGTH_SHORT).show();
             return;
         }
         hideKeyboard();
-        PendingPhotoAction action = new PendingPhotoAction(input.getText().toString().trim());
+        PendingPhotoAction action = new PendingPhotoAction(input.getText().toString().trim(), imageMode);
         if (android.os.Build.VERSION.SDK_INT >= 23
                 && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             pendingPhotoAction = action;
@@ -462,9 +477,9 @@ public class MainActivity extends Activity {
         pendingPhotoAction = action;
         CameraCaptureView captureView = new CameraCaptureView(this);
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("拍图识别")
+                .setTitle(isSheetMusicMode(action.imageMode) ? "乐谱扫描" : "拍图识别")
                 .setView(captureView)
-                .setPositiveButton("识别", null)
+                .setPositiveButton(isSheetMusicMode(action.imageMode) ? "扫描" : "识别", null)
                 .setNegativeButton("取消", null)
                 .create();
         dialog.setOnShowListener(d -> {
@@ -472,7 +487,7 @@ public class MainActivity extends Activity {
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
                 captureView.takePicture(jpegBytes -> runOnUiThread(() -> {
                     dialog.dismiss();
-                    setPendingPhoto(jpegBytes, action.prompt);
+                    setPendingPhoto(jpegBytes, action.prompt, action.imageMode);
                 }), error -> runOnUiThread(() -> {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
                     Toast.makeText(this, error, Toast.LENGTH_SHORT).show();
@@ -483,18 +498,21 @@ public class MainActivity extends Activity {
         dialog.show();
     }
 
-    private void setPendingPhoto(byte[] jpegBytes, String promptText) {
+    private void setPendingPhoto(byte[] jpegBytes, String promptText, String imageMode) {
         byte[] imageBytes = normalizeVisionImage(jpegBytes);
         String prompt = promptText == null ? "" : promptText.trim();
-        pendingPhoto = new PendingPhoto(imageBytes, thumbnailBase64(imageBytes), prompt);
+        if (prompt.isEmpty() && isSheetMusicMode(imageMode)) {
+            prompt = SHEET_MUSIC_DEFAULT_PROMPT;
+        }
+        pendingPhoto = new PendingPhoto(imageBytes, thumbnailBase64(imageBytes), prompt, imageMode);
         if (!prompt.isEmpty()) {
             input.setText(prompt);
             input.setSelection(input.getText().length());
         } else {
-            input.setHint("输入图片识别要求");
+            input.setHint(isSheetMusicMode(imageMode) ? "输入乐谱识别要求" : "输入图片识别要求");
         }
         updatePendingPhotoPreview();
-        Toast.makeText(this, "图片已暂存，确认后点发送", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, isSheetMusicMode(imageMode) ? "乐谱已暂存，确认后点发送" : "图片已暂存，确认后点发送", Toast.LENGTH_SHORT).show();
     }
 
     private void sendPendingPhoto(String promptText) {
@@ -510,14 +528,17 @@ public class MainActivity extends Activity {
         ensureActiveConversation();
         String prompt = promptText == null ? "" : promptText.trim();
         if (prompt.isEmpty()) {
-            prompt = "请识别并描述这张图片。";
+            prompt = isSheetMusicMode(photo.imageMode) ? SHEET_MUSIC_DEFAULT_PROMPT : "请识别并描述这张图片。";
         }
         input.setText("");
         clearPendingPhoto();
         if (messages.isEmpty()) {
             currentConversation.title = "图片识别";
         }
-        ChatMessage userPhotoMessage = ChatMessage.photo(prompt, photo.thumbnailBase64);
+        String displayPrompt = isSheetMusicMode(photo.imageMode) && SHEET_MUSIC_DEFAULT_PROMPT.equals(prompt)
+                ? "扫描乐谱"
+                : prompt;
+        ChatMessage userPhotoMessage = ChatMessage.photo(displayPrompt, photo.thumbnailBase64, photo.imageMode);
         messages.add(userPhotoMessage);
         pendingMessage = new ChatMessage(ChatMessage.ROLE_ASSISTANT, "正在连接服务器...");
         messages.add(pendingMessage);
@@ -532,7 +553,9 @@ public class MainActivity extends Activity {
             try {
                 String apiKey = ensureGatewayApiKey();
                 client.ping(apiKey);
-                runOnUiThread(() -> updatePendingMessage("服务器已连通，正在识别图片..."));
+                runOnUiThread(() -> updatePendingMessage(isSheetMusicMode(photo.imageMode)
+                        ? "服务器已连通，正在扫描乐谱..."
+                        : "服务器已连通，正在识别图片..."));
                 String answer = client.visionChat(apiKey, model, requestMessages, photo.jpegBytes, finalPrompt);
                 runOnUiThread(() -> {
                     replacePendingMessage(answer);
@@ -568,10 +591,20 @@ public class MainActivity extends Activity {
         if (thumbnail != null) {
             pendingPhotoImage.setImageBitmap(thumbnail);
         }
+        String label = isSheetMusicMode(pendingPhoto.imageMode) ? "乐谱" : "图片";
         pendingPhotoText.setText(pendingPhoto.prompt.isEmpty()
-                ? "图片已暂存。输入识别要求后点发送。"
-                : "图片已暂存：" + pendingPhoto.prompt);
+                ? label + "已暂存。输入识别要求后点发送。"
+                : label + "已暂存：" + compactPreviewText(pendingPhoto.prompt));
         pendingPhotoPreview.setVisibility(View.VISIBLE);
+    }
+
+    private String compactPreviewText(String text) {
+        String clean = text.replace('\n', ' ').trim();
+        return clean.length() <= 44 ? clean : clean.substring(0, 44) + "...";
+    }
+
+    private boolean isSheetMusicMode(String imageMode) {
+        return IMAGE_MODE_SHEET_MUSIC.equals(imageMode);
     }
 
     private byte[] normalizeVisionImage(byte[] jpegBytes) {
@@ -1141,6 +1174,7 @@ public class MainActivity extends Activity {
         statusText.setText(status == null ? "" : status);
         statusText.setVisibility(loading ? View.VISIBLE : View.GONE);
         cameraButton.setEnabled(!loading);
+        sheetMusicButton.setEnabled(!loading);
         sendButton.setEnabled(!loading);
         input.setEnabled(!loading);
     }
@@ -1176,7 +1210,8 @@ public class MainActivity extends Activity {
         String[] tips = {
                 "服务器已连通，正在生成回复...",
                 "连接正常，正在思考...",
-                "请求已送达，稍等一下..."
+                "请求已送达，稍等一下...",
+                "正在核对图像细节..."
         };
         return tips[random.nextInt(tips.length)];
     }
@@ -1290,21 +1325,25 @@ public class MainActivity extends Activity {
 
     private static final class PendingPhotoAction {
         final String prompt;
+        final String imageMode;
 
-        PendingPhotoAction(String prompt) {
+        PendingPhotoAction(String prompt, String imageMode) {
             this.prompt = prompt;
+            this.imageMode = imageMode == null || imageMode.trim().isEmpty() ? IMAGE_MODE_PHOTO : imageMode.trim();
         }
     }
 
     private static final class PendingPhoto {
         final byte[] jpegBytes;
         final String thumbnailBase64;
+        final String imageMode;
         String prompt;
 
-        PendingPhoto(byte[] jpegBytes, String thumbnailBase64, String prompt) {
+        PendingPhoto(byte[] jpegBytes, String thumbnailBase64, String prompt, String imageMode) {
             this.jpegBytes = jpegBytes;
             this.thumbnailBase64 = thumbnailBase64 == null ? "" : thumbnailBase64;
             this.prompt = prompt == null ? "" : prompt;
+            this.imageMode = imageMode == null || imageMode.trim().isEmpty() ? IMAGE_MODE_PHOTO : imageMode.trim();
         }
     }
 
