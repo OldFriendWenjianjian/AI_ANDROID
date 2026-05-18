@@ -1,5 +1,6 @@
 .gradle/
 .idea/
+.playwright-mcp/
 build/
 app/build/
 local.properties
