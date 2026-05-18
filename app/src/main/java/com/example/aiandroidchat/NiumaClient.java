@@ -251,7 +251,9 @@ final class NiumaClient {
             ChatMessage message = history.get(i);
             JSONObject item = new JSONObject();
             item.put("role", message.role);
-            item.put("content", message.content);
+            item.put("content", message.hasImage()
+                    ? "[图片] " + message.content
+                    : message.content);
             messages.put(item);
         }
         return messages;

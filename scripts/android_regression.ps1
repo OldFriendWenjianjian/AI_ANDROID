@@ -40,13 +40,26 @@ function Get-NodeBounds {
     }
 }
 
-Write-Host '1/6 检查设备和用户...'
+function Tap-Center {
+    param([pscustomobject]$Bounds)
+    $x = [int](($Bounds.Left + $Bounds.Right) / 2)
+    $y = [int](($Bounds.Top + $Bounds.Bottom) / 2)
+    Invoke-Adb @('shell', 'input', 'tap', "$x", "$y") | Out-Null
+}
+
+function Start-App {
+    Invoke-Adb @('shell', 'am', 'start', '-W', '--user', '0', '-n', "$Package/.MainActivity") | Out-Host
+    $focus = Invoke-Adb @('shell', 'dumpsys', 'window') | Out-String
+    Assert-Contains $focus ([regex]::Escape("$Package/.MainActivity")) '前台焦点不是目标 Activity'
+}
+
+Write-Host '1/7 检查设备和用户...'
 $devices = Invoke-Adb @('devices', '-l') | Out-String
 Assert-Contains $devices '\bdevice\b' '没有可用 adb 设备'
 $users = Invoke-Adb @('shell', 'pm', 'list', 'users') | Out-String
 Assert-Contains $users 'UserInfo\{0:' '未检测到机主用户 0'
 
-Write-Host '2/6 安装到机主用户 0...'
+Write-Host '2/7 安装到机主用户 0...'
 Invoke-Adb @('install', '-r', '--user', '0', $Apk) | Out-Host
 $user0 = Invoke-Adb @('shell', 'pm', 'list', 'packages', '--user', '0') | Out-String
 Assert-Contains $user0 ([regex]::Escape($Package)) '用户 0 未安装目标包'
@@ -57,15 +70,16 @@ if ($users -match 'UserInfo\{900:') {
     }
 }
 
-Write-Host '3/6 启动 App...'
+Write-Host '3/7 启动 App...'
 Invoke-Adb @('shell', 'am', 'force-stop', $Package) | Out-Null
-Invoke-Adb @('shell', 'am', 'start', '-W', '--user', '0', '-n', "$Package/.MainActivity") | Out-Host
-$focus = Invoke-Adb @('shell', 'dumpsys', 'window') | Out-String
-Assert-Contains $focus ([regex]::Escape("$Package/.MainActivity")) '前台焦点不是目标 Activity'
+Start-App
 
-Write-Host '4/6 验证键盘不遮挡输入框...'
+Write-Host '4/7 验证键盘不遮挡输入框...'
+Start-App
 Invoke-Adb @('shell', 'input', 'tap', '620', '200') | Out-Null
 Start-Sleep -Milliseconds 800
+Invoke-Adb @('shell', 'input', 'tap', '220', '2235') | Out-Null
+Start-Sleep -Milliseconds 500
 Invoke-Adb @('shell', 'input', 'tap', '220', '2235') | Out-Null
 Start-Sleep -Seconds 1
 $ime = Invoke-Adb @('shell', 'dumpsys', 'input_method') | Out-String
@@ -84,9 +98,32 @@ if ($inputBounds.Bottom -gt $safeBottom -or $cameraBounds.Bottom -gt $safeBottom
 }
 Write-Host "键盘回归通过：inputBottom=$($inputBounds.Bottom), cameraBottom=$($cameraBounds.Bottom), sendBottom=$($sendBounds.Bottom)"
 
-Write-Host '5/6 验证新建和历史入口...'
+Write-Host '5/7 验证模型选择不锁住输入区...'
+Start-App
+Invoke-Adb @('shell', 'input', 'tap', '960', '200') | Out-Null
+Start-Sleep -Milliseconds 500
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_account.xml') | Out-Null
+$accountXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_account.xml') | Out-String
+$modelButtonBounds = Get-NodeBounds $accountXml '模型选择'
+Tap-Center $modelButtonBounds
+Start-Sleep -Milliseconds 500
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_model_loading.xml') | Out-Null
+$modelXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_model_loading.xml') | Out-String
+Assert-Contains $modelXml '正在读取模型列表|使用默认列表|gpt-5' '模型选择加载或选项弹窗没有出现'
+Invoke-Adb @('shell', 'input', 'keyevent', 'BACK') | Out-Null
+Start-Sleep -Milliseconds 300
 Invoke-Adb @('shell', 'input', 'keyevent', 'BACK') | Out-Null
 Start-Sleep -Milliseconds 500
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_after_model_cancel.xml') | Out-Null
+$afterModelXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_after_model_cancel.xml') | Out-String
+Assert-Contains $afterModelXml 'text="拍照"[^>]*enabled="true"' '取消模型选择后拍照按钮仍不可用'
+Assert-Contains $afterModelXml 'text="发送"[^>]*enabled="true"' '取消模型选择后发送按钮仍不可用'
+if ($afterModelXml -match '正在读取模型列表') {
+    throw '取消模型选择后仍显示全局模型加载状态'
+}
+
+Write-Host '6/7 验证新建和历史入口...'
+Start-App
 Invoke-Adb @('shell', 'input', 'tap', '620', '200') | Out-Null
 Start-Sleep -Milliseconds 800
 Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_new.xml') | Out-Null
@@ -99,7 +136,7 @@ $historyXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_history.xml') | Ou
 Assert-Contains $historyXml '历史对话' '历史弹窗没有出现'
 Invoke-Adb @('shell', 'input', 'keyevent', 'BACK') | Out-Null
 
-Write-Host '6/6 检查崩溃日志...'
+Write-Host '7/7 检查崩溃日志...'
 $logs = Invoke-Adb @('shell', 'logcat', '-d', '-t', '500') | Out-String
 if ($logs -match 'FATAL EXCEPTION' -and $logs -match [regex]::Escape($Package)) {
     throw '发现目标 App 崩溃日志'

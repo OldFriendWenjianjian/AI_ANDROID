@@ -12,7 +12,9 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.hardware.Camera;
 import android.os.Bundle;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -23,6 +25,7 @@ import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -42,6 +45,10 @@ import java.util.Locale;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MainActivity extends Activity {
     private static final String BRAND_NAME = "Smart Human";
@@ -57,6 +64,7 @@ public class MainActivity extends Activity {
     private static final String KEY_MODEL = "model";
     private static final int GATEWAY_API_KEY_VERSION = 2;
     private static final int REQUEST_CAMERA_PERMISSION = 1001;
+    private static final int MODEL_LOAD_TIMEOUT_MS = 8_000;
     private static final String DEFAULT_MODEL = "gpt-5.4-mini";
     private static final String[] DEFAULT_MODELS = {
             "gpt-5.4-mini",
@@ -69,13 +77,17 @@ public class MainActivity extends Activity {
     private final List<Conversation> conversations = new ArrayList<>();
     private final List<ChatMessage> messages = new ArrayList<>();
     private final NiumaClient client = new NiumaClient();
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService executor = Executors.newFixedThreadPool(3);
+    private final ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1);
 
     private SharedPreferences prefs;
     private Conversation currentConversation;
     private LinearLayout root;
     private LinearLayout messagesLayout;
     private ScrollView scrollView;
+    private LinearLayout pendingPhotoPreview;
+    private ImageView pendingPhotoImage;
+    private TextView pendingPhotoText;
     private EditText input;
     private Button cameraButton;
     private Button sendButton;
@@ -83,6 +95,7 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private ChatMessage pendingMessage;
     private PendingPhotoAction pendingPhotoAction;
+    private PendingPhoto pendingPhoto;
     private final Random random = new Random();
 
     @Override
@@ -104,6 +117,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         executor.shutdownNow();
+        scheduler.shutdownNow();
         super.onDestroy();
     }
 
@@ -170,6 +184,37 @@ public class MainActivity extends Activity {
         root.addView(statusText, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(28)));
 
+        pendingPhotoPreview = new LinearLayout(this);
+        pendingPhotoPreview.setOrientation(LinearLayout.HORIZONTAL);
+        pendingPhotoPreview.setGravity(Gravity.CENTER_VERTICAL);
+        pendingPhotoPreview.setPadding(dp(10), dp(8), dp(10), dp(8));
+        pendingPhotoPreview.setBackgroundResource(R.drawable.input_background);
+        pendingPhotoPreview.setVisibility(View.GONE);
+
+        pendingPhotoImage = new ImageView(this);
+        pendingPhotoImage.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        pendingPhotoPreview.addView(pendingPhotoImage, new LinearLayout.LayoutParams(dp(58), dp(58)));
+
+        pendingPhotoText = new TextView(this);
+        pendingPhotoText.setTextColor(Color.rgb(58, 67, 80));
+        pendingPhotoText.setTextSize(13);
+        pendingPhotoText.setSingleLine(false);
+        LinearLayout.LayoutParams pendingPhotoTextParams = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        pendingPhotoTextParams.leftMargin = dp(10);
+        pendingPhotoPreview.addView(pendingPhotoText, pendingPhotoTextParams);
+
+        Button removePhotoButton = new Button(this);
+        removePhotoButton.setText("移除");
+        removePhotoButton.setAllCaps(false);
+        removePhotoButton.setOnClickListener(v -> clearPendingPhoto());
+        pendingPhotoPreview.addView(removePhotoButton, new LinearLayout.LayoutParams(dp(64), dp(44)));
+
+        LinearLayout.LayoutParams pendingPhotoParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        pendingPhotoParams.bottomMargin = dp(4);
+        root.addView(pendingPhotoPreview, pendingPhotoParams);
+
         LinearLayout composer = new LinearLayout(this);
         composer.setOrientation(LinearLayout.HORIZONTAL);
         composer.setGravity(Gravity.BOTTOM);
@@ -187,6 +232,23 @@ public class MainActivity extends Activity {
         input.setOnFocusChangeListener((v, hasFocus) -> {
             if (hasFocus) {
                 scrollToBottom();
+            }
+        });
+        input.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                if (pendingPhoto != null) {
+                    pendingPhoto.prompt = s == null ? "" : s.toString().trim();
+                    updatePendingPhotoPreview();
+                }
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
             }
         });
         composer.addView(input, new LinearLayout.LayoutParams(0,
@@ -273,15 +335,7 @@ public class MainActivity extends Activity {
         }
 
         for (ChatMessage message : messages) {
-            TextView bubble = new TextView(this);
-            bubble.setText(message.content);
-            bubble.setTextSize(16);
-            bubble.setLineSpacing(dp(2), 1.0f);
-            bubble.setTextColor(message.isUser() ? Color.WHITE : Color.rgb(27, 34, 43));
-            bubble.setBackgroundResource(message.isUser()
-                    ? R.drawable.chat_bubble_user
-                    : R.drawable.chat_bubble_assistant);
-            bubble.setGravity(Gravity.START);
+            View bubble = message.hasImage() ? photoBubble(message) : textBubble(message);
 
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -294,8 +348,52 @@ public class MainActivity extends Activity {
         scrollToBottom();
     }
 
+    private TextView textBubble(ChatMessage message) {
+        TextView bubble = new TextView(this);
+        bubble.setText(message.content);
+        bubble.setTextSize(16);
+        bubble.setLineSpacing(dp(2), 1.0f);
+        bubble.setTextColor(message.isUser() ? Color.WHITE : Color.rgb(27, 34, 43));
+        bubble.setBackgroundResource(message.isUser()
+                ? R.drawable.chat_bubble_user
+                : R.drawable.chat_bubble_assistant);
+        bubble.setGravity(Gravity.START);
+        return bubble;
+    }
+
+    private LinearLayout photoBubble(ChatMessage message) {
+        LinearLayout bubble = new LinearLayout(this);
+        bubble.setOrientation(LinearLayout.VERTICAL);
+        bubble.setPadding(dp(10), dp(10), dp(10), dp(10));
+        bubble.setBackgroundResource(R.drawable.chat_bubble_user);
+        ImageView image = new ImageView(this);
+        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        Bitmap bitmap = decodeBase64Bitmap(message.imageThumbnailBase64);
+        if (bitmap != null) {
+            image.setImageBitmap(bitmap);
+        }
+        bubble.addView(image, new LinearLayout.LayoutParams(dp(150), dp(110)));
+        if (!message.content.trim().isEmpty()) {
+            TextView prompt = new TextView(this);
+            prompt.setText(message.content.trim());
+            prompt.setTextColor(Color.WHITE);
+            prompt.setTextSize(14);
+            prompt.setLineSpacing(dp(2), 1.0f);
+            LinearLayout.LayoutParams promptParams = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            promptParams.topMargin = dp(6);
+            bubble.addView(prompt, promptParams);
+        }
+        return bubble;
+    }
+
     private void sendMessage() {
         String text = input.getText().toString().trim();
+        if (pendingPhoto != null) {
+            sendPendingPhoto(text);
+            return;
+        }
         if (text.isEmpty()) {
             return;
         }
@@ -374,7 +472,7 @@ public class MainActivity extends Activity {
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
                 captureView.takePicture(jpegBytes -> runOnUiThread(() -> {
                     dialog.dismiss();
-                    sendPhotoForRecognition(jpegBytes, action.prompt);
+                    setPendingPhoto(jpegBytes, action.prompt);
                 }), error -> runOnUiThread(() -> {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
                     Toast.makeText(this, error, Toast.LENGTH_SHORT).show();
@@ -385,18 +483,41 @@ public class MainActivity extends Activity {
         dialog.show();
     }
 
-    private void sendPhotoForRecognition(byte[] jpegBytes, String promptText) {
+    private void setPendingPhoto(byte[] jpegBytes, String promptText) {
         byte[] imageBytes = normalizeVisionImage(jpegBytes);
+        String prompt = promptText == null ? "" : promptText.trim();
+        pendingPhoto = new PendingPhoto(imageBytes, thumbnailBase64(imageBytes), prompt);
+        if (!prompt.isEmpty()) {
+            input.setText(prompt);
+            input.setSelection(input.getText().length());
+        } else {
+            input.setHint("输入图片识别要求");
+        }
+        updatePendingPhotoPreview();
+        Toast.makeText(this, "图片已暂存，确认后点发送", Toast.LENGTH_SHORT).show();
+    }
+
+    private void sendPendingPhoto(String promptText) {
+        if (pendingPhoto == null) {
+            return;
+        }
+        if (!isLoggedIn()) {
+            showAuthDialog(false);
+            Toast.makeText(this, "请先登录" + BRAND_NAME + "账号", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        PendingPhoto photo = pendingPhoto;
         ensureActiveConversation();
         String prompt = promptText == null ? "" : promptText.trim();
         if (prompt.isEmpty()) {
             prompt = "请识别并描述这张图片。";
         }
         input.setText("");
+        clearPendingPhoto();
         if (messages.isEmpty()) {
             currentConversation.title = "图片识别";
         }
-        ChatMessage userPhotoMessage = new ChatMessage(ChatMessage.ROLE_USER, "[图片] " + prompt);
+        ChatMessage userPhotoMessage = ChatMessage.photo(prompt, photo.thumbnailBase64);
         messages.add(userPhotoMessage);
         pendingMessage = new ChatMessage(ChatMessage.ROLE_ASSISTANT, "正在连接服务器...");
         messages.add(pendingMessage);
@@ -412,7 +533,7 @@ public class MainActivity extends Activity {
                 String apiKey = ensureGatewayApiKey();
                 client.ping(apiKey);
                 runOnUiThread(() -> updatePendingMessage("服务器已连通，正在识别图片..."));
-                String answer = client.visionChat(apiKey, model, requestMessages, imageBytes, finalPrompt);
+                String answer = client.visionChat(apiKey, model, requestMessages, photo.jpegBytes, finalPrompt);
                 runOnUiThread(() -> {
                     replacePendingMessage(answer);
                     saveCurrentConversation();
@@ -428,6 +549,29 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    private void clearPendingPhoto() {
+        pendingPhoto = null;
+        pendingPhotoPreview.setVisibility(View.GONE);
+        pendingPhotoImage.setImageDrawable(null);
+        pendingPhotoText.setText("");
+        input.setHint("输入消息");
+    }
+
+    private void updatePendingPhotoPreview() {
+        if (pendingPhoto == null) {
+            pendingPhotoPreview.setVisibility(View.GONE);
+            return;
+        }
+        Bitmap thumbnail = decodeBase64Bitmap(pendingPhoto.thumbnailBase64);
+        if (thumbnail != null) {
+            pendingPhotoImage.setImageBitmap(thumbnail);
+        }
+        pendingPhotoText.setText(pendingPhoto.prompt.isEmpty()
+                ? "图片已暂存。输入识别要求后点发送。"
+                : "图片已暂存：" + pendingPhoto.prompt);
+        pendingPhotoPreview.setVisibility(View.VISIBLE);
     }
 
     private byte[] normalizeVisionImage(byte[] jpegBytes) {
@@ -450,6 +594,37 @@ public class MainActivity extends Activity {
         }
         bitmap.recycle();
         return output.toByteArray();
+    }
+
+    private String thumbnailBase64(byte[] jpegBytes) {
+        Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+        if (bitmap == null) {
+            return "";
+        }
+        int maxSide = Math.max(bitmap.getWidth(), bitmap.getHeight());
+        float scale = maxSide <= 240 ? 1f : 240f / maxSide;
+        int width = Math.max(1, Math.round(bitmap.getWidth() * scale));
+        int height = Math.max(1, Math.round(bitmap.getHeight() * scale));
+        Bitmap thumbnail = Bitmap.createScaledBitmap(bitmap, width, height, true);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        thumbnail.compress(Bitmap.CompressFormat.JPEG, 72, output);
+        if (thumbnail != bitmap) {
+            thumbnail.recycle();
+        }
+        bitmap.recycle();
+        return android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP);
+    }
+
+    private Bitmap decodeBase64Bitmap(String base64) {
+        if (base64 == null || base64.isEmpty()) {
+            return null;
+        }
+        try {
+            byte[] bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT);
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private ArrayList<ChatMessage> messagesWithoutPending() {
@@ -569,6 +744,9 @@ public class MainActivity extends Activity {
                     dialog.dismiss();
                     setLoading(false, "");
                     Toast.makeText(this, registerMode ? "注册并登录成功，可以直接聊天" : "登录成功", Toast.LENGTH_SHORT).show();
+                    if (registerMode) {
+                        showModelDialog(true);
+                    }
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -619,36 +797,87 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle(BRAND_NAME + "账号")
                 .setMessage("当前账号：" + email + "\nAPI Key：" + keyState + "\n模型：" + getModel())
-                .setPositiveButton("模型选择", (dialog, which) -> showModelDialog())
+                .setPositiveButton("模型选择", (dialog, which) -> showModelDialog(false))
                 .setNegativeButton("退出登录", (dialog, which) -> logout())
                 .setNeutralButton("关闭", null)
                 .show();
     }
 
-    private void showModelDialog() {
-        setLoading(true, "正在读取模型列表...");
-        executor.execute(() -> {
+    private void showModelDialog(boolean afterRegister) {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dp(18), dp(8), dp(18), 0);
+        ProgressBar spinner = new ProgressBar(this);
+        layout.addView(spinner, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
+        TextView note = new TextView(this);
+        note.setText(afterRegister ? "账号已创建，正在读取可用模型..." : "正在读取模型列表...");
+        note.setTextColor(Color.rgb(94, 105, 120));
+        note.setTextSize(14);
+        layout.addView(note);
+
+        AlertDialog loadingDialog = new AlertDialog.Builder(this)
+                .setTitle(afterRegister ? "选择默认模型" : "模型选择")
+                .setView(layout)
+                .setNegativeButton("使用默认列表", null)
+                .create();
+        AtomicBoolean delivered = new AtomicBoolean(false);
+        loadingDialog.setOnShowListener(d -> loadingDialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+            if (delivered.compareAndSet(false, true)) {
+                loadingDialog.dismiss();
+                showModelChoices(defaultModelList(), afterRegister);
+            }
+        }));
+        loadingDialog.show();
+
+        Future<?> request = executor.submit(() -> {
             ArrayList<String> models = new ArrayList<>();
             try {
                 if (isLoggedIn()) {
-                    models.addAll(client.models(ensureGatewayApiKey()));
+                    models.addAll(filterChatModels(client.models(ensureGatewayApiKey())));
                 }
             } catch (Exception ignored) {
                 // Fall back to the known working models.
             }
             if (models.isEmpty()) {
-                for (String model : DEFAULT_MODELS) {
-                    models.add(model);
-                }
+                models.addAll(defaultModelList());
             }
             runOnUiThread(() -> {
-                setLoading(false, "");
-                showModelChoices(models);
+                if (delivered.compareAndSet(false, true)) {
+                    loadingDialog.dismiss();
+                    showModelChoices(models, afterRegister);
+                }
             });
         });
+        scheduler.schedule(() -> runOnUiThread(() -> {
+            if (delivered.compareAndSet(false, true)) {
+                request.cancel(true);
+                loadingDialog.dismiss();
+                Toast.makeText(this, "读取模型较慢，先使用默认列表", Toast.LENGTH_SHORT).show();
+                showModelChoices(defaultModelList(), afterRegister);
+            }
+        }), MODEL_LOAD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
-    private void showModelChoices(List<String> models) {
+    private ArrayList<String> defaultModelList() {
+        ArrayList<String> models = new ArrayList<>();
+        for (String model : DEFAULT_MODELS) {
+            models.add(model);
+        }
+        return models;
+    }
+
+    private ArrayList<String> filterChatModels(List<String> remoteModels) {
+        ArrayList<String> models = new ArrayList<>();
+        for (String model : remoteModels) {
+            if (isChatModel(model)) {
+                models.add(model);
+            }
+        }
+        return models;
+    }
+
+    private void showModelChoices(List<String> models, boolean afterRegister) {
         String[] items = models.toArray(new String[0]);
         int checked = 0;
         String current = getModel();
@@ -660,7 +889,7 @@ public class MainActivity extends Activity {
         }
         final int[] selected = {checked};
         new AlertDialog.Builder(this)
-                .setTitle("模型选择")
+                .setTitle(afterRegister ? "请选择默认模型" : "模型选择")
                 .setSingleChoiceItems(items, checked, (dialog, which) -> selected[0] = which)
                 .setPositiveButton("保存", (dialog, which) -> {
                     prefs.edit().putString(KEY_MODEL, items[selected[0]]).apply();
@@ -783,6 +1012,7 @@ public class MainActivity extends Activity {
     }
 
     private void logout() {
+        clearPendingPhoto();
         prefs.edit()
                 .remove(KEY_ACCESS_TOKEN)
                 .remove(KEY_REFRESH_TOKEN)
@@ -795,7 +1025,29 @@ public class MainActivity extends Activity {
 
     private String getModel() {
         String model = prefs.getString(KEY_MODEL, BuildConfig.OPENAI_MODEL);
-        return model == null || model.trim().isEmpty() ? DEFAULT_MODEL : model.trim();
+        if (model == null || model.trim().isEmpty()) {
+            return DEFAULT_MODEL;
+        }
+        model = model.trim();
+        return isChatModel(model) ? model : DEFAULT_MODEL;
+    }
+
+    private boolean isChatModel(String model) {
+        if (model == null) {
+            return false;
+        }
+        String clean = model.trim().toLowerCase(Locale.US);
+        if (clean.isEmpty()) {
+            return false;
+        }
+        return !clean.startsWith("gpt-image")
+                && !clean.contains("image-generation")
+                && !clean.contains("dall-e")
+                && !clean.contains("embedding")
+                && !clean.contains("whisper")
+                && !clean.contains("tts")
+                && !clean.contains("transcribe")
+                && !clean.contains("audio");
     }
 
     private void loadConversations() {
@@ -1041,6 +1293,18 @@ public class MainActivity extends Activity {
 
         PendingPhotoAction(String prompt) {
             this.prompt = prompt;
+        }
+    }
+
+    private static final class PendingPhoto {
+        final byte[] jpegBytes;
+        final String thumbnailBase64;
+        String prompt;
+
+        PendingPhoto(byte[] jpegBytes, String thumbnailBase64, String prompt) {
+            this.jpegBytes = jpegBytes;
+            this.thumbnailBase64 = thumbnailBase64 == null ? "" : thumbnailBase64;
+            this.prompt = prompt == null ? "" : prompt;
         }
     }
 
