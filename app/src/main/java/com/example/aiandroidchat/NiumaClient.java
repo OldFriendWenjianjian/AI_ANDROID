@@ -5,6 +5,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -19,6 +20,15 @@ final class NiumaClient {
     private static final String API_BASE = BASE_URL + "/api/v1";
     private static final int TIMEOUT_MS = 60_000;
     private static final String FALLBACK_MODEL = "gpt-5.4-mini";
+    static final String IMAGE_GENERATION_MODEL = "gpt-image-2";
+    private static final String SYSTEM_PROMPT =
+            "你是 Smart Human App 内的中文 AI 助手。请根据用户意图主动选择最有帮助的回答方式："
+                    + "\n1. 先理解上下文和目标，信息不足时先给出合理假设并提出最少量澄清问题。"
+                    + "\n2. 默认用中文，直接、可靠、可执行；复杂问题先给结论，再给步骤、原因和注意事项。"
+                    + "\n3. 输出适合手机阅读的 Markdown：短标题、项目符号、编号步骤、表格或代码块；避免大段无结构文字。"
+                    + "\n4. 遇到代码、命令、配置、公式、乐谱识别、图片识别时，保留关键细节，不确定处明确标注“待确认”。"
+                    + "\n5. 不编造事实；涉及当前、价格、法律、医疗、金融等可能变化或高风险内容时说明不确定性。"
+                    + "\n6. 如果用户要求生成图片、海报、插画或视觉方案，先给可用于出图的清晰描述；App 会自动调用图片模型。";
 
     JSONObject publicSettings() throws IOException, JSONException {
         return request("GET", API_BASE + "/settings/public", null, null).optJSONObject("data");
@@ -182,6 +192,44 @@ final class NiumaClient {
         }
     }
 
+    ImageResult generateImage(String apiKey, String prompt) throws IOException, JSONException {
+        HttpURLConnection connection = open("POST", BASE_URL + "/v1/images/generations", null);
+        connection.setRequestProperty("Authorization", "Bearer " + apiKey);
+
+        JSONObject body = new JSONObject();
+        body.put("model", IMAGE_GENERATION_MODEL);
+        body.put("prompt", prompt == null || prompt.trim().isEmpty()
+                ? "生成一张清晰、自然、有完整主体的图片。"
+                : prompt.trim());
+        body.put("n", 1);
+        body.put("size", "1024x1024");
+        writeBody(connection, body);
+
+        int code = connection.getResponseCode();
+        String response = readAll(code >= 200 && code < 300
+                ? connection.getInputStream()
+                : connection.getErrorStream());
+        if (code < 200 || code >= 300) {
+            throw new IOException(parseError(code, response));
+        }
+        JSONObject root = new JSONObject(response);
+        JSONArray data = root.optJSONArray("data");
+        if (data != null && data.length() > 0) {
+            JSONObject first = data.optJSONObject(0);
+            if (first != null) {
+                String imageBase64 = first.optString("b64_json", "");
+                if (!imageBase64.isEmpty()) {
+                    return new ImageResult(imageBase64, first.optString("revised_prompt", ""));
+                }
+                String imageUrl = first.optString("url", "");
+                if (!imageUrl.isEmpty()) {
+                    return new ImageResult(downloadImageBase64(imageUrl), first.optString("revised_prompt", ""));
+                }
+            }
+        }
+        throw new IOException("图片模型没有返回可显示的图片数据。");
+    }
+
     private String chatOnce(String apiKey, String model, List<ChatMessage> history) throws IOException, JSONException {
         HttpURLConnection connection = open("POST", BASE_URL + "/v1/chat/completions", null);
         connection.setRequestProperty("Authorization", "Bearer " + apiKey);
@@ -243,7 +291,7 @@ final class NiumaClient {
         JSONArray messages = new JSONArray();
         JSONObject system = new JSONObject();
         system.put("role", ChatMessage.ROLE_SYSTEM);
-        system.put("content", "你是一个简洁、可靠的中文 AI 助手。");
+        system.put("content", SYSTEM_PROMPT);
         messages.put(system);
 
         int start = Math.max(0, history.size() - 20);
@@ -383,5 +431,35 @@ final class NiumaClient {
             }
         }
         return builder.toString();
+    }
+
+    private String downloadImageBase64(String imageUrl) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(imageUrl).openConnection();
+        connection.setRequestMethod("GET");
+        connection.setConnectTimeout(TIMEOUT_MS);
+        connection.setReadTimeout(TIMEOUT_MS);
+        int code = connection.getResponseCode();
+        if (code < 200 || code >= 300) {
+            throw new IOException("图片下载失败 " + code);
+        }
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        try (InputStream input = connection.getInputStream()) {
+            int read;
+            while ((read = input.read(buffer)) >= 0) {
+                output.write(buffer, 0, read);
+            }
+        }
+        return android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP);
+    }
+
+    static final class ImageResult {
+        final String imageBase64;
+        final String revisedPrompt;
+
+        ImageResult(String imageBase64, String revisedPrompt) {
+            this.imageBase64 = imageBase64 == null ? "" : imageBase64;
+            this.revisedPrompt = revisedPrompt == null ? "" : revisedPrompt;
+        }
     }
 }

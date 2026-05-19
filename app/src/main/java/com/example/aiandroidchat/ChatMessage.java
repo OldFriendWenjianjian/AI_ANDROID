@@ -9,6 +9,7 @@ final class ChatMessage {
     static final String ROLE_SYSTEM = "system";
     static final String IMAGE_MODE_PHOTO = "photo";
     static final String IMAGE_MODE_SHEET_MUSIC = "sheet_music";
+    static final String IMAGE_MODE_GENERATED = "generated_image";
 
     final String role;
     final String content;
@@ -46,6 +47,11 @@ final class ChatMessage {
 
     static ChatMessage photo(String prompt, String thumbnailBase64, String imageMode) {
         return new ChatMessage(ROLE_USER, prompt, System.currentTimeMillis(), thumbnailBase64, imageMode);
+    }
+
+    static ChatMessage generatedImage(String caption, String thumbnailBase64) {
+        return new ChatMessage(ROLE_ASSISTANT, caption, System.currentTimeMillis(),
+                thumbnailBase64, IMAGE_MODE_GENERATED);
     }
 
     JSONObject toJson() throws JSONException {

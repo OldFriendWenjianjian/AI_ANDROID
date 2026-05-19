@@ -12,9 +12,17 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.hardware.Camera;
 import android.os.Bundle;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.text.style.BackgroundColorSpan;
+import android.text.style.BulletSpan;
+import android.text.style.LeadingMarginSpan;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.StyleSpan;
+import android.text.style.TypefaceSpan;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -49,6 +57,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String BRAND_NAME = "Smart Human";
@@ -72,6 +82,7 @@ public class MainActivity extends Activity {
                     + "\n请输出：1. 标题/调号/拍号/速度/乐器或声部；2. 按系统和小节整理音符、节奏、和弦、歌词、指法或TAB品位；"
                     + "3. 重复记号、反复段落、升降号和休止符；4. 可疑或模糊的小节；5. 如信息足够，给出可复制的 MusicXML 草稿。";
     private static final String DEFAULT_MODEL = "gpt-5.4-mini";
+    private static final String IMAGE_MODEL = NiumaClient.IMAGE_GENERATION_MODEL;
     private static final String[] DEFAULT_MODELS = {
             "gpt-5.4-mini",
             "gpt-5.4",
@@ -79,6 +90,9 @@ public class MainActivity extends Activity {
             "gpt-5.3-codex",
             "gpt-5.3-codex-spark"
     };
+    private static final Pattern BOLD_PATTERN = Pattern.compile("\\*\\*(.+?)\\*\\*");
+    private static final Pattern INLINE_CODE_PATTERN = Pattern.compile("`([^`]+?)`");
+    private static final Pattern NUMBERED_PATTERN = Pattern.compile("^\\s*\\d+[.)、]\\s+.*");
 
     private final List<Conversation> conversations = new ArrayList<>();
     private final List<ChatMessage> messages = new ArrayList<>();
@@ -365,7 +379,7 @@ public class MainActivity extends Activity {
 
     private TextView textBubble(ChatMessage message) {
         TextView bubble = new TextView(this);
-        bubble.setText(message.content);
+        bubble.setText(message.isUser() ? message.content : renderAssistantText(message.content));
         bubble.setTextSize(16);
         bubble.setLineSpacing(dp(2), 1.0f);
         bubble.setTextColor(message.isUser() ? Color.WHITE : Color.rgb(27, 34, 43));
@@ -373,6 +387,7 @@ public class MainActivity extends Activity {
                 ? R.drawable.chat_bubble_user
                 : R.drawable.chat_bubble_assistant);
         bubble.setGravity(Gravity.START);
+        bubble.setTextIsSelectable(!message.isUser());
         return bubble;
     }
 
@@ -380,7 +395,9 @@ public class MainActivity extends Activity {
         LinearLayout bubble = new LinearLayout(this);
         bubble.setOrientation(LinearLayout.VERTICAL);
         bubble.setPadding(dp(10), dp(10), dp(10), dp(10));
-        bubble.setBackgroundResource(R.drawable.chat_bubble_user);
+        bubble.setBackgroundResource(message.isUser()
+                ? R.drawable.chat_bubble_user
+                : R.drawable.chat_bubble_assistant);
         ImageView image = new ImageView(this);
         image.setScaleType(ImageView.ScaleType.CENTER_CROP);
         Bitmap bitmap = decodeBase64Bitmap(message.imageThumbnailBase64);
@@ -390,8 +407,10 @@ public class MainActivity extends Activity {
         bubble.addView(image, new LinearLayout.LayoutParams(dp(150), dp(110)));
         if (!message.content.trim().isEmpty()) {
             TextView prompt = new TextView(this);
-            prompt.setText(message.content.trim());
-            prompt.setTextColor(Color.WHITE);
+            prompt.setText(message.isUser()
+                    ? message.content.trim()
+                    : renderAssistantText(message.content.trim()));
+            prompt.setTextColor(message.isUser() ? Color.WHITE : Color.rgb(27, 34, 43));
             prompt.setTextSize(14);
             prompt.setLineSpacing(dp(2), 1.0f);
             LinearLayout.LayoutParams promptParams = new LinearLayout.LayoutParams(
@@ -424,6 +443,7 @@ public class MainActivity extends Activity {
         if (messages.isEmpty()) {
             currentConversation.title = titleFromText(text);
         }
+        boolean imageRequest = shouldGenerateImage(text);
         messages.add(new ChatMessage(ChatMessage.ROLE_USER, text));
         pendingMessage = new ChatMessage(ChatMessage.ROLE_ASSISTANT, "正在连接服务器...");
         messages.add(pendingMessage);
@@ -437,14 +457,26 @@ public class MainActivity extends Activity {
             try {
                 String apiKey = ensureGatewayApiKey();
                 client.ping(apiKey);
-                runOnUiThread(() -> updatePendingMessage("服务器已连通，正在生成回复..."));
-                String answer = client.chat(apiKey, model, requestMessages);
-                runOnUiThread(() -> {
-                    replacePendingMessage(answer);
-                    saveCurrentConversation();
-                    renderMessages();
-                    setLoading(false, "");
-                });
+                if (imageRequest) {
+                    runOnUiThread(() -> updatePendingMessage("服务器已连通，正在调用 " + IMAGE_MODEL + " 生成图片..."));
+                    NiumaClient.ImageResult result = client.generateImage(apiKey, buildImagePrompt(text));
+                    runOnUiThread(() -> {
+                        replacePendingMessage("图片已生成。");
+                        messages.add(ChatMessage.generatedImage(imageCaption(result), result.imageBase64));
+                        saveCurrentConversation();
+                        renderMessages();
+                        setLoading(false, "");
+                    });
+                } else {
+                    runOnUiThread(() -> updatePendingMessage("服务器已连通，正在生成回复..."));
+                    String answer = client.chat(apiKey, model, requestMessages);
+                    runOnUiThread(() -> {
+                        replacePendingMessage(answer);
+                        saveCurrentConversation();
+                        renderMessages();
+                        setLoading(false, "");
+                    });
+                }
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     replacePendingMessage(userFacingError(e));
@@ -829,7 +861,10 @@ public class MainActivity extends Activity {
         String keyState = prefs.getString(KEY_GATEWAY_API_KEY, "").isEmpty() ? "未创建" : "已保存";
         new AlertDialog.Builder(this)
                 .setTitle(BRAND_NAME + "账号")
-                .setMessage("当前账号：" + email + "\nAPI Key：" + keyState + "\n模型：" + getModel())
+                .setMessage("当前账号：" + email
+                        + "\nAPI Key：" + keyState
+                        + "\n对话模型：" + getModel()
+                        + "\n图片模型：" + IMAGE_MODEL + "（自动调用）")
                 .setPositiveButton("模型选择", (dialog, which) -> showModelDialog(false))
                 .setNegativeButton("退出登录", (dialog, which) -> logout())
                 .setNeutralButton("关闭", null)
@@ -922,7 +957,7 @@ public class MainActivity extends Activity {
         }
         final int[] selected = {checked};
         new AlertDialog.Builder(this)
-                .setTitle(afterRegister ? "请选择默认模型" : "模型选择")
+                .setTitle(afterRegister ? "请选择默认对话模型" : "模型选择")
                 .setSingleChoiceItems(items, checked, (dialog, which) -> selected[0] = which)
                 .setPositiveButton("保存", (dialog, which) -> {
                     prefs.edit().putString(KEY_MODEL, items[selected[0]]).apply();
@@ -1081,6 +1116,150 @@ public class MainActivity extends Activity {
                 && !clean.contains("tts")
                 && !clean.contains("transcribe")
                 && !clean.contains("audio");
+    }
+
+    private boolean shouldGenerateImage(String text) {
+        if (text == null) {
+            return false;
+        }
+        String clean = text.trim().toLowerCase(Locale.US);
+        if (clean.isEmpty()) {
+            return false;
+        }
+        if (clean.contains("不要生成图片") || clean.contains("不用生成图片") || clean.contains("别生成图片")) {
+            return false;
+        }
+        return clean.contains("gpt-image")
+                || clean.contains("生成图片")
+                || clean.contains("生成一张图")
+                || clean.contains("画一张")
+                || clean.contains("帮我画")
+                || clean.contains("做一张")
+                || clean.contains("出一张")
+                || clean.contains("设计海报")
+                || clean.contains("生成海报")
+                || clean.contains("image");
+    }
+
+    private String buildImagePrompt(String text) {
+        return "请根据下面的中文需求生成一张高质量图片。保持主体清晰、构图完整、可直接查看；"
+                + "如果需求里有文字，请让文字简短、醒目、排版干净。需求：\n" + text.trim();
+    }
+
+    private String imageCaption(NiumaClient.ImageResult result) {
+        if (result != null && result.revisedPrompt != null && !result.revisedPrompt.trim().isEmpty()) {
+            return "生成图片\n\n" + result.revisedPrompt.trim();
+        }
+        return "生成图片";
+    }
+
+    private CharSequence renderAssistantText(String content) {
+        if (content == null || content.isEmpty()) {
+            return "";
+        }
+        SpannableStringBuilder builder = new SpannableStringBuilder();
+        String[] lines = content.replace("\r\n", "\n").split("\n", -1);
+        boolean inCodeBlock = false;
+        int codeBlockStart = -1;
+        for (String rawLine : lines) {
+            String line = rawLine;
+            String trimmed = line.trim();
+            if (trimmed.startsWith("```")) {
+                if (inCodeBlock) {
+                    int end = builder.length();
+                    if (codeBlockStart >= 0 && end > codeBlockStart) {
+                        builder.setSpan(new TypefaceSpan("monospace"), codeBlockStart, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        builder.setSpan(new BackgroundColorSpan(Color.rgb(235, 238, 242)),
+                                codeBlockStart, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    }
+                    inCodeBlock = false;
+                    codeBlockStart = -1;
+                } else {
+                    inCodeBlock = true;
+                    codeBlockStart = builder.length();
+                }
+                continue;
+            }
+
+            int start = builder.length();
+            String visibleLine = line;
+            boolean heading = false;
+            boolean bullet = false;
+            boolean numbered = false;
+            if (!inCodeBlock) {
+                if (trimmed.startsWith("### ")) {
+                    visibleLine = trimmed.substring(4);
+                    heading = true;
+                } else if (trimmed.startsWith("## ")) {
+                    visibleLine = trimmed.substring(3);
+                    heading = true;
+                } else if (trimmed.startsWith("# ")) {
+                    visibleLine = trimmed.substring(2);
+                    heading = true;
+                } else if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+                    visibleLine = trimmed.substring(2);
+                    bullet = true;
+                } else if (NUMBERED_PATTERN.matcher(trimmed).matches()) {
+                    visibleLine = trimmed;
+                    numbered = true;
+                }
+            }
+            builder.append(visibleLine);
+            int end = builder.length();
+            if (heading && end > start) {
+                builder.setSpan(new StyleSpan(android.graphics.Typeface.BOLD), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                builder.setSpan(new RelativeSizeSpan(1.12f), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else if (bullet && end > start) {
+                builder.setSpan(new BulletSpan(dp(8)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                builder.setSpan(new LeadingMarginSpan.Standard(dp(18)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else if (numbered && end > start) {
+                builder.setSpan(new LeadingMarginSpan.Standard(dp(18)), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else if (inCodeBlock && end > start) {
+                builder.setSpan(new TypefaceSpan("monospace"), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            if (!inCodeBlock) {
+                applyInlineMarkdown(builder, start, end);
+            }
+            builder.append('\n');
+        }
+        trimTrailingNewlines(builder);
+        return builder;
+    }
+
+    private void applyInlineMarkdown(SpannableStringBuilder builder, int start, int end) {
+        int lineEnd = Math.min(end, builder.length());
+        applyPatternSpan(builder, BOLD_PATTERN, start, lineEnd, true);
+        lineEnd = builder.length();
+        applyPatternSpan(builder, INLINE_CODE_PATTERN, start, lineEnd, false);
+    }
+
+    private void applyPatternSpan(SpannableStringBuilder builder, Pattern pattern, int start, int end, boolean bold) {
+        String text = builder.subSequence(start, end).toString();
+        Matcher matcher = pattern.matcher(text);
+        int removed = 0;
+        while (matcher.find()) {
+            int matchStart = start + matcher.start() - removed;
+            int matchEnd = start + matcher.end() - removed;
+            int innerStart = start + matcher.start(1) - removed;
+            int innerEnd = start + matcher.end(1) - removed;
+            int marker = bold ? 2 : 1;
+            builder.delete(matchEnd - marker, matchEnd);
+            builder.delete(matchStart, matchStart + marker);
+            if (bold) {
+                builder.setSpan(new StyleSpan(android.graphics.Typeface.BOLD),
+                        innerStart - marker, innerEnd - marker, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else {
+                builder.setSpan(new TypefaceSpan("monospace"),
+                        innerStart - marker, innerEnd - marker, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            removed += marker * 2;
+        }
+    }
+
+    private void trimTrailingNewlines(SpannableStringBuilder builder) {
+        while (builder.length() > 0 && builder.charAt(builder.length() - 1) == '\n') {
+            builder.delete(builder.length() - 1, builder.length());
+        }
     }
 
     private void loadConversations() {
