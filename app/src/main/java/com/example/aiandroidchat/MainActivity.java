@@ -62,6 +62,7 @@ import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String BRAND_NAME = "Smart Human";
+    private static final String APP_TITLE = "Smart Human ChatGPT";
     private static final String PREFS = "ai_chat_prefs";
     private static final String KEY_LEGACY_HISTORY = "history";
     private static final String KEY_CONVERSATIONS = "conversations";
@@ -154,9 +155,9 @@ public class MainActivity extends Activity {
         topBar.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(this);
-        title.setText("AI Chat");
+        title.setText(APP_TITLE);
         title.setTextColor(Color.rgb(24, 30, 38));
-        title.setTextSize(21);
+        title.setTextSize(18);
         title.setGravity(Gravity.CENTER_VERTICAL);
         topBar.addView(title, new LinearLayout.LayoutParams(0, dp(44), 1));
 
@@ -387,7 +388,8 @@ public class MainActivity extends Activity {
                 ? R.drawable.chat_bubble_user
                 : R.drawable.chat_bubble_assistant);
         bubble.setGravity(Gravity.START);
-        bubble.setTextIsSelectable(!message.isUser());
+        bubble.setFocusable(false);
+        bubble.setFocusableInTouchMode(false);
         return bubble;
     }
 
@@ -458,7 +460,8 @@ public class MainActivity extends Activity {
                 String apiKey = ensureGatewayApiKey();
                 client.ping(apiKey);
                 if (imageRequest) {
-                    runOnUiThread(() -> updatePendingMessage("服务器已连通，正在调用 " + IMAGE_MODEL + " 生成图片..."));
+                    runOnUiThread(() -> updatePendingMessage("服务器已连通，正在调用 " + IMAGE_MODEL + " 生成图片...",
+                            "正在生成图片..."));
                     NiumaClient.ImageResult result = client.generateImage(apiKey, buildImagePrompt(text));
                     runOnUiThread(() -> {
                         replacePendingMessage("图片已生成。");
@@ -468,7 +471,8 @@ public class MainActivity extends Activity {
                         setLoading(false, "");
                     });
                 } else {
-                    runOnUiThread(() -> updatePendingMessage("服务器已连通，正在生成回复..."));
+                    runOnUiThread(() -> updatePendingMessage("服务器已连通，正在生成回复...",
+                            "正在生成回复..."));
                     String answer = client.chat(apiKey, model, requestMessages);
                     runOnUiThread(() -> {
                         replacePendingMessage(answer);
@@ -585,9 +589,12 @@ public class MainActivity extends Activity {
             try {
                 String apiKey = ensureGatewayApiKey();
                 client.ping(apiKey);
+                String pendingText = isSheetMusicMode(photo.imageMode)
+                        ? "正在扫描乐谱..."
+                        : "正在识别图片...";
                 runOnUiThread(() -> updatePendingMessage(isSheetMusicMode(photo.imageMode)
                         ? "服务器已连通，正在扫描乐谱..."
-                        : "服务器已连通，正在识别图片..."));
+                        : "服务器已连通，正在识别图片...", pendingText));
                 String answer = client.visionChat(apiKey, model, requestMessages, photo.jpegBytes, finalPrompt);
                 runOnUiThread(() -> {
                     replacePendingMessage(answer);
@@ -1355,14 +1362,17 @@ public class MainActivity extends Activity {
         cameraButton.setEnabled(!loading);
         sheetMusicButton.setEnabled(!loading);
         sendButton.setEnabled(!loading);
-        input.setEnabled(!loading);
     }
 
     private void updatePendingMessage(String status) {
+        updatePendingMessage(status, waitingText(false));
+    }
+
+    private void updatePendingMessage(String status, String messageText) {
         if (pendingMessage != null) {
             int index = messages.indexOf(pendingMessage);
             if (index >= 0) {
-                pendingMessage = new ChatMessage(ChatMessage.ROLE_ASSISTANT, waitingText());
+                pendingMessage = new ChatMessage(ChatMessage.ROLE_ASSISTANT, messageText);
                 messages.set(index, pendingMessage);
             }
         }
@@ -1386,11 +1396,22 @@ public class MainActivity extends Activity {
     }
 
     private String waitingText() {
+        return waitingText(false);
+    }
+
+    private String waitingText(boolean imageRelated) {
+        if (imageRelated) {
+            String[] imageTips = {
+                    "正在核对图像细节...",
+                    "正在识别画面内容...",
+                    "正在整理图像结果..."
+            };
+            return imageTips[random.nextInt(imageTips.length)];
+        }
         String[] tips = {
                 "服务器已连通，正在生成回复...",
                 "连接正常，正在思考...",
-                "请求已送达，稍等一下...",
-                "正在核对图像细节..."
+                "请求已送达，稍等一下..."
         };
         return tips[random.nextInt(tips.length)];
     }

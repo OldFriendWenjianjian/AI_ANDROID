@@ -40,6 +40,24 @@ function Get-NodeBounds {
     }
 }
 
+function Get-ClassBounds {
+    param(
+        [string]$Xml,
+        [string]$Class
+    )
+    $pattern = 'class="' + [regex]::Escape($Class) + '".*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"'
+    $match = [regex]::Match($Xml, $pattern, 'Singleline')
+    if (-not $match.Success) {
+        throw "未找到控件类：$Class"
+    }
+    [pscustomobject]@{
+        Left = [int]$match.Groups[1].Value
+        Top = [int]$match.Groups[2].Value
+        Right = [int]$match.Groups[3].Value
+        Bottom = [int]$match.Groups[4].Value
+    }
+}
+
 function Tap-Center {
     param([pscustomobject]$Bounds)
     $x = [int](($Bounds.Left + $Bounds.Right) / 2)
@@ -59,13 +77,13 @@ function Start-App {
     Assert-Contains $focus ([regex]::Escape("$Package/.MainActivity")) '前台焦点不是目标 Activity'
 }
 
-Write-Host '1/7 检查设备和用户...'
+Write-Host '1/8 检查设备和用户...'
 $devices = Invoke-Adb @('devices', '-l') | Out-String
 Assert-Contains $devices '\bdevice\b' '没有可用 adb 设备'
 $users = Invoke-Adb @('shell', 'pm', 'list', 'users') | Out-String
 Assert-Contains $users 'UserInfo\{0:' '未检测到机主用户 0'
 
-Write-Host '2/7 安装到机主用户 0...'
+Write-Host '2/8 安装到机主用户 0...'
 Invoke-Adb @('install', '-r', '--user', '0', $Apk) | Out-Host
 $user0 = Invoke-Adb @('shell', 'pm', 'list', 'packages', '--user', '0') | Out-String
 Assert-Contains $user0 ([regex]::Escape($Package)) '用户 0 未安装目标包'
@@ -76,11 +94,11 @@ if ($users -match 'UserInfo\{900:') {
     }
 }
 
-Write-Host '3/7 启动 App...'
+Write-Host '3/8 启动 App...'
 Invoke-Adb @('shell', 'am', 'force-stop', $Package) | Out-Null
 Start-App
 
-Write-Host '4/7 验证键盘不遮挡输入框...'
+Write-Host '4/8 验证键盘不遮挡输入框...'
 Start-App
 Invoke-Adb @('shell', 'input', 'tap', '620', '200') | Out-Null
 Start-Sleep -Milliseconds 800
@@ -105,7 +123,7 @@ if ($inputBounds.Bottom -gt $safeBottom -or $cameraBounds.Bottom -gt $safeBottom
 }
 Write-Host "键盘回归通过：inputBottom=$($inputBounds.Bottom), cameraBottom=$($cameraBounds.Bottom), sheetMusicBottom=$($sheetMusicBounds.Bottom), sendBottom=$($sendBounds.Bottom)"
 
-Write-Host '5/7 验证模型选择不锁住输入区...'
+Write-Host '5/8 验证模型选择不锁住输入区...'
 Start-App
 Invoke-Adb @('shell', 'input', 'tap', '960', '200') | Out-Null
 Start-Sleep -Milliseconds 500
@@ -129,7 +147,7 @@ if ($afterModelXml -match '正在读取模型列表') {
     throw '取消模型选择后仍显示全局模型加载状态'
 }
 
-Write-Host '6/7 验证新建和历史入口...'
+Write-Host '6/8 验证新建和历史入口...'
 Start-App
 Invoke-Adb @('shell', 'input', 'tap', '620', '200') | Out-Null
 Start-Sleep -Milliseconds 800
@@ -143,7 +161,39 @@ $historyXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_history.xml') | Ou
 Assert-Contains $historyXml '历史对话' '历史弹窗没有出现'
 Invoke-Adb @('shell', 'input', 'keyevent', 'BACK') | Out-Null
 
-Write-Host '7/7 检查崩溃日志...'
+Write-Host '7/8 验证发送后输入框仍可输入...'
+Start-App
+Invoke-Adb @('shell', 'input', 'tap', '620', '200') | Out-Null
+Start-Sleep -Milliseconds 700
+Invoke-Adb @('shell', 'input', 'keyevent', 'BACK') | Out-Null
+Start-Sleep -Milliseconds 300
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_focus_empty.xml') | Out-Null
+$focusEmptyXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_focus_empty.xml') | Out-String
+$focusInputBounds = Get-ClassBounds $focusEmptyXml 'android.widget.EditText'
+Tap-Center $focusInputBounds
+Start-Sleep -Milliseconds 300
+Invoke-Adb @('shell', 'input', 'text', 'plainrequest') | Out-Null
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_focus_typed.xml') | Out-Null
+$focusTypedXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_focus_typed.xml') | Out-String
+$focusSendBounds = Get-NodeBounds $focusTypedXml '发送'
+Tap-Center $focusSendBounds
+Start-Sleep -Milliseconds 900
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_focus_after_send.xml') | Out-Null
+$focusAfterSendXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_focus_after_send.xml') | Out-String
+$focusDraftBounds = Get-ClassBounds $focusAfterSendXml 'android.widget.EditText'
+Tap-Center $focusDraftBounds
+Start-Sleep -Milliseconds 300
+Invoke-Adb @('shell', 'input', 'text', 'draftafter') | Out-Null
+Start-Sleep -Milliseconds 800
+Invoke-Adb @('shell', 'uiautomator', 'dump', '/sdcard/window_focus_after_draft.xml') | Out-Null
+$focusDraftXml = Invoke-Adb @('exec-out', 'cat', '/sdcard/window_focus_after_draft.xml') | Out-String
+Assert-Contains $focusDraftXml 'draftafter' '发送后输入框未显示继续输入的文字'
+if ($focusDraftXml -match '正在核对图像细节') {
+    throw '文字请求显示了图像等待文案'
+}
+Assert-Contains $focusDraftXml 'Smart Human ChatGPT' '主标题未更新为 Smart Human ChatGPT'
+
+Write-Host '8/8 检查崩溃日志...'
 $logs = Invoke-Adb @('shell', 'logcat', '-d', '-t', '500') | Out-String
 if ($logs -match 'FATAL EXCEPTION' -and $logs -match [regex]::Escape($Package)) {
     throw '发现目标 App 崩溃日志'
