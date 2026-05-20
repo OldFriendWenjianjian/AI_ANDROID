@@ -10,6 +10,12 @@ android {
         buildConfig true
     }
 
+    def releaseProps = new Properties()
+    def releasePropsFile = rootProject.file("release.properties")
+    if (releasePropsFile.exists()) {
+        releasePropsFile.withInputStream { releaseProps.load(it) }
+    }
+
     defaultConfig {
         applicationId "com.example.aiandroidchat"
         minSdk 23
@@ -18,6 +24,27 @@ android {
         versionName "1.0"
 
         buildConfigField "String", "OPENAI_MODEL", "\"gpt-5.4-mini\""
+    }
+
+    signingConfigs {
+        release {
+            if (releasePropsFile.exists()) {
+                storeFile rootProject.file(releaseProps["storeFile"])
+                storePassword releaseProps["storePassword"]
+                keyAlias releaseProps["keyAlias"]
+                keyPassword releaseProps["keyPassword"]
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            if (releasePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
 
     compileOptions {

@@ -4,6 +4,9 @@
 build/
 app/build/
 local.properties
+release.properties
+keystore/
+dist/
 *.iml
 
 # Local debugging artifacts generated during real-device testing.
